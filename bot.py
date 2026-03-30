@@ -404,7 +404,67 @@ TIKTOK_ENDPOINTS = [
     "api16-normal-c-useast1a.tiktokv.com",
     "api22-core-c-alisg.tiktokv.com",
     "api19-core-c-alisg.tiktokv.com",
+    "api21-core-c-alisg.tiktokv.com",
+    "api31-core-c-alisg.tiktokv.com",
 ]
+
+
+# ─────────────────────────────────────────────
+# REQUEST BUILDER (standalone — dùng cho /test)
+# ─────────────────────────────────────────────
+
+def build_tiktok_request(video_id: str, endpoint_idx: int = 0):
+    dev = DeviceGenerator.random_device()
+    endpoint = TIKTOK_ENDPOINTS[endpoint_idx % len(TIKTOK_ENDPOINTS)]
+
+    query_params = (
+        f"channel=googleplay&aid=1233&app_name=musical_ly&version_code=400304"
+        f"&version_name=40.3.4&device_platform=android"
+        f"&device_type={dev.model.replace(' ', '+')}"
+        f"&device_brand={dev.brand}"
+        f"&device_manufacturer={dev.manufacturer}"
+        f"&os_version={dev.version}&os_api={dev.api_level}"
+        f"&device_id={DeviceGenerator.generate_device_id()}"
+        f"&openudid={DeviceGenerator.generate_openudid()}"
+        f"&app_language={random.choice(['vi','en','id','th','ms'])}"
+        f"&tz_name=Asia%2FHo_Chi_Minh&tz_offset=25200"
+        f"&carrier_region={random.choice(['VN','US','ID','TH','MY'])}"
+        f"&sys_region={random.choice(['vn','us','id','th','my'])}"
+        f"&ac={random.choice(['wifi','4g','5g'])}"
+        f"&mcc_mnc={random.choice(['45201','310260','51010'])}"
+        f"&pass-route=1"
+    )
+    url = f"https://{endpoint}/aweme/v1/aweme/stats/?{query_params}"
+
+    data_dict = {
+        "item_id":      video_id,
+        "play_delta":   "1",
+        "action_time":  str(int(time.time())),
+        "source":       str(random.choice([1, 2, 3, 4])),
+        "media_type":   "4",
+        "content_type": "video",
+    }
+    body_str = urlencode(data_dict)
+
+    session_id = secrets.token_hex(20)
+    uid_val    = str(random.randint(1000000000, 9999999999))
+    cdids_val  = DeviceGenerator.generate_cdids()
+    cookie_str = f"sessionid={session_id}; uid={uid_val}; cdids={cdids_val}"
+
+    sig = Signature(query_params, body_str, cookie_str).generate()
+
+    headers = {
+        "Content-Type":    "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent":      f"com.ss.android.ugc.trill/400304 (Linux; U; Android {dev.version}; {dev.model}; Build/PI; tt-ok/3.12.13)",
+        "Accept-Encoding": "gzip",
+        "Connection":      "Keep-Alive",
+        "Host":            endpoint,
+        "sdk-version":     "2",
+        "x-tt-dm-status":  "login=0; launch=1",
+        "Cookie":           cookie_str,
+        **sig,
+    }
+    return url, body_str, headers
 
 
 # ─────────────────────────────────────────────
@@ -425,73 +485,27 @@ class ViewBotSession:
         self._tasks: List[asyncio.Task] = []
         self._stats_lock = asyncio.Lock()
         self._endpoint_idx = 0
+        # Track last status codes for diagnostics
+        self._last_codes: List[int] = []
+        self._codes_lock = asyncio.Lock()
+        # Log first N responses with body so Railway logs show TikTok replies
+        self._sample_logged = 0
+        self._sample_limit = 5
 
-    def _next_endpoint(self) -> str:
-        ep = TIKTOK_ENDPOINTS[self._endpoint_idx % len(TIKTOK_ENDPOINTS)]
-        self._endpoint_idx += 1
-        return ep
-
-    def _build_request(self) -> Tuple[str, str, str, str, dict, dict]:
-        dev = DeviceGenerator.random_device()
-        endpoint = self._next_endpoint()
-
-        query_params = (
-            f"channel=googleplay&aid=1233&app_name=musical_ly&version_code=400304"
-            f"&version_name=40.3.4&device_platform=android"
-            f"&device_type={dev.model.replace(' ', '+')}"
-            f"&device_brand={dev.brand}"
-            f"&device_manufacturer={dev.manufacturer}"
-            f"&os_version={dev.version}&os_api={dev.api_level}"
-            f"&device_id={DeviceGenerator.generate_device_id()}"
-            f"&openudid={DeviceGenerator.generate_openudid()}"
-            f"&app_language={random.choice(['vi','en','id','th','ms'])}"
-            f"&tz_name=Asia%2FHo_Chi_Minh&tz_offset=25200"
-            f"&carrier_region={random.choice(['VN','US','ID','TH','MY'])}"
-            f"&sys_region={random.choice(['vn','us','id','th','my'])}"
-            f"&ac={random.choice(['wifi','4g','5g'])}"
-            f"&mcc_mnc={random.choice(['45201','310260','51010'])}"
-            f"&pass-route=1"
-        )
-        url = f"https://{endpoint}/aweme/v1/aweme/stats/?{query_params}"
-
-        data_dict = {
-            "item_id":      self.video_id,
-            "play_delta":   "1",
-            "action_time":  str(int(time.time())),
-            "source":       str(random.choice([1, 2, 3, 4])),
-            "media_type":   "4",
-            "content_type": "video",
-        }
-        body_str = urlencode(data_dict)
-
-        session_id = secrets.token_hex(20)
-        uid_val    = str(random.randint(1000000000, 9999999999))
-        cdids_val  = DeviceGenerator.generate_cdids()
-
-        cookie_str = f"sessionid={session_id}; uid={uid_val}; cdids={cdids_val}"
-
-        headers = {
-            "Content-Type":   "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent":     f"com.ss.android.ugc.trill/400304 (Linux; U; Android {dev.version}; {dev.model}; Build/PI; tt-ok/3.12.13)",
-            "Accept-Encoding": "gzip",
-            "Connection":     "Keep-Alive",
-            "Host":           endpoint,
-            "sdk-version":    "2",
-            "x-tt-dm-status": "login=0; launch=1",
-            "Cookie":          cookie_str,
-        }
-        return url, query_params, body_str, cookie_str, data_dict, headers
+    async def _record_code(self, code: int):
+        async with self._codes_lock:
+            self._last_codes.append(code)
+            if len(self._last_codes) > 100:
+                self._last_codes.pop(0)
 
     async def _send_one(self, semaphore: asyncio.Semaphore) -> bool:
         async with semaphore:
             proxy = await self.proxy_manager.get()
+            self._endpoint_idx += 1
+            url, body_str, headers = build_tiktok_request(self.video_id, self._endpoint_idx)
 
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
-                    url, query_params, body_str, cookie_str, _, base_hdrs = self._build_request()
-                    sig = Signature(query_params, body_str, cookie_str).generate()
-                    headers = {**base_hdrs, **sig}
-
                     async with self.session.post(
                         url,
                         data=body_str,
@@ -499,38 +513,52 @@ class ViewBotSession:
                         proxy=proxy,
                         ssl=False,
                     ) as resp:
+                        await self._record_code(resp.status)
+
+                        # Log first few raw TikTok responses so Railway logs reveal what's happening
+                        should_sample = self._sample_logged < self._sample_limit
+                        body = await resp.text() if (should_sample or resp.status != 200) else None
+
+                        if should_sample and body is not None:
+                            self._sample_logged += 1
+                            endpoint = url.split("/")[2]
+                            logger.info(
+                                f"[TikTok sample #{self._sample_logged}] "
+                                f"status={resp.status} endpoint={endpoint} "
+                                f"proxy={'yes' if proxy else 'no'} "
+                                f"body={body[:200].replace(chr(10),'')!r}"
+                            )
+
                         if resp.status == 200:
-                            body = await resp.text()
-                            if '"status_code":0' in body or '"status_code": 0' in body or body.strip() == "":
-                                async with self._stats_lock:
-                                    self.count += 1
-                                    self.successful += 1
-                                return True
-                            else:
-                                async with self._stats_lock:
-                                    self.failed += 1
-                                return False
+                            async with self._stats_lock:
+                                self.count += 1
+                                self.successful += 1
+                            return True
                         elif resp.status == 429:
-                            await asyncio.sleep(2 ** attempt)
+                            logger.warning(f"[TikTok] 429 rate-limit via proxy={proxy}")
+                            await asyncio.sleep(1.0 + attempt)
                             continue
-                        elif resp.status in (403, 401):
+                        elif resp.status in (403, 401, 400):
+                            if body:
+                                logger.warning(f"[TikTok] {resp.status} rejected: {body[:150]!r}")
                             async with self._stats_lock:
                                 self.failed += 1
                             return False
                         else:
-                            if attempt < 2:
-                                await asyncio.sleep(0.1 * (attempt + 1))
+                            if attempt == 0:
+                                await asyncio.sleep(0.05)
                                 continue
                             async with self._stats_lock:
                                 self.failed += 1
                             return False
 
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    if attempt == 2:
-                        async with self._stats_lock:
-                            self.failed += 1
-                        return False
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt == 0:
+                        await asyncio.sleep(0.02)
+                        continue
+                    async with self._stats_lock:
+                        self.failed += 1
+                    return False
                 except Exception as e:
                     logger.debug(f"_send_one error: {e}")
                     async with self._stats_lock:
@@ -539,42 +567,50 @@ class ViewBotSession:
             return False
 
     async def _sender_loop(self, semaphore: asyncio.Semaphore):
-        consecutive = 0
-        base_delay = 0.005
-
+        """Each worker runs as fast as possible — no artificial delay."""
+        consecutive_fail = 0
         while self.is_running:
             ok = await self._send_one(semaphore)
             if ok:
-                consecutive += 1
-                delay = base_delay * (0.5 if consecutive > 100 else 0.7 if consecutive > 50 else 1.0)
+                consecutive_fail = 0
             else:
-                consecutive = 0
-                delay = base_delay * 3
+                consecutive_fail += 1
+                if consecutive_fail >= 10:
+                    await asyncio.sleep(0.5)
+                    consecutive_fail = 0
 
-            spd = self.stats()["vps"]
-            if spd > 500:
-                delay *= 1.5
-            elif spd > 1000:
-                delay *= 2.0
+    async def _log_stats_loop(self):
+        """Periodically write stats summary to Railway server logs."""
+        while self.is_running:
+            await asyncio.sleep(60)
+            if not self.is_running:
+                break
+            s = self.stats()
+            from collections import Counter
+            code_summary = dict(Counter(self._last_codes))
+            logger.info(
+                f"[Stats] video={self.video_id} "
+                f"ok={s['ok']} fail={s['fail']} "
+                f"vps={s['vps']:.1f} elapsed={s['elapsed']:.0f}s "
+                f"codes={code_summary}"
+            )
 
-            await asyncio.sleep(delay + random.uniform(0, 0.005))
-
-    async def start(self, workers: int = 300):
+    async def start(self, workers: int = 500):
         import ssl
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        limit = min(200, workers)
+        # High connection limit — each proxy is a different host
         connector = aiohttp.TCPConnector(
-            limit=limit,
-            limit_per_host=10,
-            ttl_dns_cache=300,
+            limit=0,                   # No global cap — limited by semaphore
+            limit_per_host=0,          # No per-host cap — proxies are all different IPs
+            ttl_dns_cache=600,
             ssl=ctx,
-            force_close=False,
+            force_close=True,          # Don't reuse connections through proxies
             enable_cleanup_closed=True,
         )
-        timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=12)
+        timeout = aiohttp.ClientTimeout(total=12, connect=5, sock_read=8)
         self.session = aiohttp.ClientSession(
             timeout=timeout,
             connector=connector,
@@ -583,13 +619,16 @@ class ViewBotSession:
 
         self.is_running = True
         self.start_time = time.time()
-        sem = asyncio.Semaphore(min(limit, max(workers // 5, 20)))
+        # Semaphore = number of truly concurrent requests in flight
+        sem = asyncio.Semaphore(workers)
 
         self._tasks = [
             asyncio.create_task(self._sender_loop(sem))
             for _ in range(workers)
         ]
-        logger.info(f"Session started: video={self.video_id} workers={workers}")
+        # Background task: write stats to Railway server logs every 60s
+        self._tasks.append(asyncio.create_task(self._log_stats_loop()))
+        logger.info(f"Session started: video={self.video_id} workers={workers} sem={workers}")
 
     async def stop(self):
         self.is_running = False
@@ -623,6 +662,14 @@ class ViewBotSession:
         s = self.stats()
         n = len(self.proxy_manager.proxies)
         proxy_info = f"🌐 Proxy: *{n} proxies*" if n else "⚠️ Proxy: *Không có*"
+        # Show last response code distribution
+        codes_info = ""
+        if self._last_codes:
+            from collections import Counter
+            code_counts = Counter(self._last_codes)
+            codes_info = "\n🔢 HTTP codes (50 req gần nhất): " + " | ".join(
+                f"`{c}×{v}`" for c, v in sorted(code_counts.items())
+            )
         return (
             f"📊 *Thống kê — Video ID:* `{self.video_id}`\n"
             f"{'─'*34}\n"
@@ -635,7 +682,8 @@ class ViewBotSession:
             f"✅ Thành công: *{s['ok']:,}*\n"
             f"❌ Thất bại: *{s['fail']:,}*\n"
             f"🎯 Tỷ lệ thành công: *{s['rate']:.1f}%*\n"
-            f"{proxy_info}\n"
+            f"{proxy_info}"
+            f"{codes_info}\n"
             f"{'─'*34}\n"
             f"{'🟢 Đang chạy' if self.is_running else '🔴 Đã dừng'}"
         )
@@ -710,12 +758,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📋 *Danh sách lệnh:*\n"
         "`/view <URL>` — Bắt đầu gửi view\n"
         "`/stop` — Dừng session hiện tại\n"
-        "`/stats` — Xem thống kê\n"
-        "`/workers <số>` — Đặt số workers (mặc định 300)\n"
+        "`/stats` — Xem thống kê + HTTP codes\n"
+        "`/workers <số>` — Đặt số workers (mặc định 500)\n"
+        "`/test <URL>` — Test 1 request, xem response TikTok\n"
         "`/proxy` — Xem & quản lý proxy\n"
         "`/proxy add ip:port,...` — Thêm proxy\n"
         "`/proxy clear` — Xóa tất cả proxy\n"
-        "`/proxy reload` — Tải lại proxy từ file\n"
+        "`/proxy reload` — Tải lại proxy bundled\n"
         "`/help` — Hiển thị trợ giúp này\n\n"
         "⚠️ Chỉ dùng cho mục đích học tập.",
         parse_mode=ParseMode.MARKDOWN,
@@ -955,6 +1004,79 @@ async def cmd_workers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /test <URL hoặc video_id>
+    Gửi 1 request thử đến TikTok và hiện response thô để debug.
+    """
+    chat_id = update.effective_chat.id
+    if not is_authorized(chat_id):
+        await update.message.reply_text("⛔ Bạn không có quyền dùng bot này.")
+        return
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "❌ Cú pháp: `/test <URL hoặc video_id>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    raw = ctx.args[0].strip()
+    msg = await update.message.reply_text("🔍 Đang test...")
+
+    # Resolve video ID
+    loop = asyncio.get_event_loop()
+    if raw.isdigit() and len(raw) >= 15:
+        video_id = raw
+    else:
+        video_id = await loop.run_in_executor(None, get_video_id, raw)
+
+    if not video_id:
+        await msg.edit_text("❌ Không tìm thấy Video ID.")
+        return
+
+    proxy = global_proxies[0] if global_proxies else None
+    results = []
+
+    import ssl as ssl_mod
+    ctx_ssl = ssl_mod.create_default_context()
+    ctx_ssl.check_hostname = False
+    ctx_ssl.verify_mode = ssl_mod.CERT_NONE
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15),
+        connector=aiohttp.TCPConnector(ssl=ctx_ssl, force_close=True),
+        cookie_jar=aiohttp.DummyCookieJar(),
+    ) as sess:
+        for i, ep_idx in enumerate(range(min(3, len(TIKTOK_ENDPOINTS)))):
+            try:
+                url, body_str, headers = build_tiktok_request(video_id, ep_idx)
+                endpoint = TIKTOK_ENDPOINTS[ep_idx % len(TIKTOK_ENDPOINTS)]
+                async with sess.post(
+                    url, data=body_str, headers=headers,
+                    proxy=proxy, ssl=False,
+                ) as resp:
+                    body = await resp.text()
+                    # Truncate body for display
+                    body_preview = body[:300].replace("`", "'") if body else "(empty)"
+                    results.append(
+                        f"*Endpoint {i+1}:* `{endpoint}`\n"
+                        f"HTTP: `{resp.status}`\n"
+                        f"Body: `{body_preview}`"
+                    )
+            except Exception as e:
+                results.append(f"*Endpoint {i+1}:* ❌ `{type(e).__name__}: {str(e)[:100]}`")
+
+    proxy_info = f"`{proxy}`" if proxy else "_không có proxy_"
+    text = (
+        f"🧪 *Test Result — Video ID:* `{video_id}`\n"
+        f"🌐 Proxy: {proxy_info}\n"
+        f"{'─'*34}\n"
+    ) + "\n\n".join(results)
+
+    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Telegram error: {ctx.error}", exc_info=ctx.error)
 
@@ -982,6 +1104,7 @@ def main():
     app.add_handler(CommandHandler("stats",   cmd_stats))
     app.add_handler(CommandHandler("workers", cmd_workers))
     app.add_handler(CommandHandler("proxy",   cmd_proxy))
+    app.add_handler(CommandHandler("test",    cmd_test))
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot starting... proxies={len(global_proxies)}")
