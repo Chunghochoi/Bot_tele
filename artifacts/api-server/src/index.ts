@@ -16,7 +16,29 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-async function registerWebhook() {
+async function startPolling(): Promise<void> {
+  const MAX_RETRIES = 5;
+  let attempt = 0;
+
+  while (attempt < MAX_RETRIES) {
+    try {
+      logger.info({ attempt: attempt + 1 }, "Starting long polling...");
+      await bot.launch({ dropPendingUpdates: true });
+      return;
+    } catch (err) {
+      attempt++;
+      const delay = Math.min(5000 * attempt, 30_000);
+      logger.error({ err, attempt, retryInMs: delay }, "Polling failed, retrying...");
+      if (attempt >= MAX_RETRIES) {
+        logger.error("Max polling retries reached. Bot polling will not start.");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+async function registerWebhook(): Promise<void> {
   const renderUrl = process.env.RENDER_EXTERNAL_URL ?? process.env.RENDER_URL;
 
   try {
@@ -27,9 +49,11 @@ async function registerWebhook() {
   }
 
   if (!renderUrl) {
-    bot.launch({ dropPendingUpdates: true });
-    logger.info("Development mode: started long polling");
-    return false;
+    logger.info("No RENDER_EXTERNAL_URL set — starting long polling mode");
+    startPolling().catch((err) => {
+      logger.error({ err }, "Polling startup error (non-fatal)");
+    });
+    return;
   }
 
   const webhookUrl = `${renderUrl}/api/telegram/webhook`;
@@ -40,10 +64,8 @@ async function registerWebhook() {
       max_connections: 1,
     });
     logger.info({ webhookUrl }, "Telegram webhook registered");
-    return true;
   } catch (err) {
     logger.error({ err }, "Failed to register Telegram webhook");
-    return false;
   }
 }
 
@@ -58,17 +80,18 @@ const server = app.listen(port, async (err?: Error) => {
   await registerWebhook();
 });
 
-function gracefulShutdown(signal: string) {
+function gracefulShutdown(signal: string): void {
   logger.info({ signal }, "Received shutdown signal, closing server...");
 
-  bot.stop(signal);
+  try {
+    bot.stop(signal);
+  } catch (_) {}
 
   server.close((err) => {
     if (err) {
       logger.error({ err }, "Error during server close");
       process.exit(1);
     }
-
     logger.info("Server closed gracefully");
     process.exit(0);
   });
@@ -80,7 +103,7 @@ function gracefulShutdown(signal: string) {
 }
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
 
 process.on("uncaughtException", (err) => {
   logger.error({ err }, "Uncaught exception");
@@ -88,6 +111,6 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason) => {
-  logger.error({ reason }, "Unhandled promise rejection");
-  process.exit(1);
+  logger.error({ reason }, "Unhandled promise rejection (non-fatal, continuing...)");
+  // Không exit — chỉ log để server không crash vì lỗi phụ
 });
