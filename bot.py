@@ -193,24 +193,131 @@ class ProxyManager:
 
 
 # ─────────────────────────────────────────────
-# PROXY LOADER (files + env)
+# BUNDLED PROXIES (embedded — luôn có sẵn khi deploy)
 # ─────────────────────────────────────────────
 
-def load_proxies_from_file(filepath: str) -> List[str]:
-    result = []
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                p = parse_proxy_line(line)
-                if p:
-                    result.append(p)
-        logger.info(f"Loaded {len(result)} proxies from {filepath}")
-    except FileNotFoundError:
-        logger.info(f"Proxy file not found: {filepath}")
-    except Exception as e:
-        logger.warning(f"Error loading proxy file {filepath}: {e}")
-    return result
+# Proxyscrape premium HTTP proxies
+_PROXYSCRAPE = """
+209.50.186.232:3129
+209.50.190.65:3129
+209.50.174.243:3129
+104.207.46.192:3129
+216.26.230.189:3129
+216.26.242.133:3129
+65.111.1.81:3129
+45.3.35.80:3129
+151.123.177.201:3129
+45.3.44.173:3129
+217.181.91.29:3129
+104.167.19.229:3129
+209.50.188.173:3129
+217.181.90.209:3129
+104.207.51.21:3129
+45.3.49.242:3129
+209.50.165.243:3129
+151.123.177.89:3129
+65.111.9.35:3129
+209.50.174.201:3129
+45.3.32.96:3129
+216.26.248.215:3129
+45.3.33.202:3129
+216.26.229.18:3129
+216.26.250.91:3129
+104.207.41.145:3129
+209.50.181.96:3129
+209.50.188.239:3129
+209.50.167.127:3129
+216.26.227.6:3129
+195.63.31.63:3129
+151.123.177.51:3129
+65.111.7.113:3129
+104.167.25.249:3129
+216.26.245.255:3129
+104.207.59.186:3129
+216.26.252.207:3129
+209.50.175.245:3129
+104.207.54.51:3129
+216.26.224.137:3129
+216.26.225.250:3129
+209.50.162.170:3129
+104.207.44.193:3129
+216.26.255.40:3129
+45.3.51.48:3129
+216.26.230.190:3129
+151.123.178.97:3129
+65.111.21.56:3129
+104.207.59.113:3129
+65.111.7.254:3129
+216.26.253.176:3129
+209.50.179.63:3129
+209.50.172.227:3129
+209.50.181.177:3129
+65.111.13.215:3129
+104.207.60.193:3129
+104.207.45.231:3129
+209.50.164.71:3129
+209.50.176.216:3129
+104.207.42.167:3129
+216.26.231.149:3129
+104.167.19.43:3129
+65.111.3.56:3129
+45.3.36.241:3129
+216.26.248.3:3129
+216.26.253.147:3129
+45.3.36.151:3129
+216.26.242.162:3129
+104.207.52.104:3129
+216.26.226.52:3129
+209.50.189.197:3129
+216.26.239.191:3129
+104.207.60.223:3129
+65.111.9.153:3129
+209.50.183.133:3129
+45.3.51.177:3129
+104.207.51.28:3129
+45.3.36.30:3129
+104.207.57.216:3129
+209.50.166.196:3129
+45.3.55.134:3129
+209.50.170.55:3129
+104.207.59.243:3129
+104.207.45.152:3129
+104.207.36.99:3129
+65.111.24.12:3129
+216.26.243.198:3129
+104.207.55.197:3129
+216.26.243.15:3129
+65.111.9.176:3129
+216.26.236.223:3129
+104.207.39.116:3129
+216.26.254.144:3129
+216.26.226.69:3129
+65.111.0.108:3129
+45.3.49.93:3129
+45.3.34.72:3129
+65.111.3.113:3129
+104.207.60.76:3129
+216.26.243.82:3129
+""".strip()
 
+# Webshare authenticated proxies (ip:port:user:pass)
+_WEBSHARE = """
+31.59.20.176:6754:wzkfpfxd:jb6xhihx9klb
+23.95.150.145:6114:wzkfpfxd:jb6xhihx9klb
+198.23.239.134:6540:wzkfpfxd:jb6xhihx9klb
+45.38.107.97:6014:wzkfpfxd:jb6xhihx9klb
+107.172.163.27:6543:wzkfpfxd:jb6xhihx9klb
+198.105.121.200:6462:wzkfpfxd:jb6xhihx9klb
+216.10.27.159:6837:wzkfpfxd:jb6xhihx9klb
+142.111.67.146:5611:wzkfpfxd:jb6xhihx9klb
+191.96.254.138:6185:wzkfpfxd:jb6xhihx9klb
+31.58.9.4:6077:wzkfpfxd:jb6xhihx9klb
+""".strip()
+
+
+# ─────────────────────────────────────────────
+# PROXY LOADER
+# ─────────────────────────────────────────────
 
 def load_proxies_from_env() -> List[str]:
     raw = os.getenv("PROXY_LIST", "")
@@ -226,20 +333,33 @@ def load_proxies_from_env() -> List[str]:
 
 
 def load_all_proxies() -> List[str]:
-    """Load proxies from all sources: bundled files + env variable."""
-    base_dir = Path(__file__).parent
+    """Load proxies from all sources: bundled lists + env variable."""
     all_proxies: List[str] = []
 
-    # Load bundled proxy files
-    proxy_files = [
-        "proxyscrape_premium_http_proxies_1774854538314.txt",
-        "Webshare_10_proxies_1774854538316.txt",
-    ]
-    for fname in proxy_files:
-        fpath = base_dir / fname
-        all_proxies.extend(load_proxies_from_file(str(fpath)))
+    # Load bundled proxy lists
+    for raw_block in [_PROXYSCRAPE, _WEBSHARE]:
+        for line in raw_block.splitlines():
+            p = parse_proxy_line(line)
+            if p:
+                all_proxies.append(p)
 
-    # Load from env (appended last, may override or supplement)
+    # Also try loading from external files if present
+    base_dir = Path(__file__).parent
+    for fname in ["proxyscrape_proxies.txt", "webshare_proxies.txt",
+                  "proxyscrape_premium_http_proxies_1774854538314.txt",
+                  "Webshare_10_proxies_1774854538316.txt"]:
+        fpath = base_dir / fname
+        if fpath.exists():
+            try:
+                for line in fpath.read_text(encoding="utf-8").splitlines():
+                    p = parse_proxy_line(line)
+                    if p:
+                        all_proxies.append(p)
+                logger.info(f"Loaded extra proxies from {fname}")
+            except Exception as e:
+                logger.warning(f"Could not read {fname}: {e}")
+
+    # Load from env variable
     all_proxies.extend(load_proxies_from_env())
 
     # Deduplicate while preserving order
@@ -636,7 +756,7 @@ async def cmd_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         new_proxies = []
-        for item in re.split(r"[,\n]+", raw):
+        for item in re.split(r"[,\s]+", raw):
             p = parse_proxy_line(item)
             if p:
                 new_proxies.append(p)
