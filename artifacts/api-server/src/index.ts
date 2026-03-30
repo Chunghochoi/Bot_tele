@@ -19,15 +19,26 @@ if (Number.isNaN(port) || port <= 0) {
 async function registerWebhook() {
   const renderUrl = process.env.RENDER_EXTERNAL_URL ?? process.env.RENDER_URL;
 
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    logger.info("Cleared existing webhook and dropped pending updates");
+  } catch (err) {
+    logger.warn({ err }, "Could not delete existing webhook");
+  }
+
   if (!renderUrl) {
-    logger.warn("RENDER_EXTERNAL_URL not set — skipping Telegram webhook registration (using polling in dev)");
+    bot.launch({ dropPendingUpdates: true });
+    logger.info("Development mode: started long polling");
     return false;
   }
 
   const webhookUrl = `${renderUrl}/api/telegram/webhook`;
 
   try {
-    await bot.telegram.setWebhook(webhookUrl);
+    await bot.telegram.setWebhook(webhookUrl, {
+      drop_pending_updates: true,
+      max_connections: 1,
+    });
     logger.info({ webhookUrl }, "Telegram webhook registered");
     return true;
   } catch (err) {
@@ -44,17 +55,13 @@ const server = app.listen(port, async (err?: Error) => {
 
   logger.info({ port }, "Server listening");
 
-  const isProduction = process.env.NODE_ENV === "production";
-
-  if (isProduction) {
-    await registerWebhook();
-  } else {
-    logger.info("Development mode: use 'ngrok' or set RENDER_EXTERNAL_URL to test webhook");
-  }
+  await registerWebhook();
 });
 
 function gracefulShutdown(signal: string) {
   logger.info({ signal }, "Received shutdown signal, closing server...");
+
+  bot.stop(signal);
 
   server.close((err) => {
     if (err) {
