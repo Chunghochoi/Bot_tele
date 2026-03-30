@@ -865,7 +865,11 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot starting... proxies={len(global_proxies)}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
