@@ -12,6 +12,8 @@ from hashlib import md5
 from time import time as T
 from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass
+from urllib.parse import urlencode
+from pathlib import Path
 from telegram import Update, Bot
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -41,10 +43,13 @@ class DeviceGenerator:
     DEVICES = [
         DeviceInfo("Pixel 6",    "13", 33, "Google",  "oriole",      "Google"),
         DeviceInfo("Pixel 7",    "14", 34, "Google",  "panther",     "Google"),
+        DeviceInfo("Pixel 8",    "14", 34, "Google",  "shiba",       "Google"),
         DeviceInfo("SM-S901B",   "13", 33, "Samsung", "dm3q",        "samsung"),
         DeviceInfo("SM-S911B",   "14", 34, "Samsung", "e1s",         "samsung"),
+        DeviceInfo("SM-S928B",   "14", 34, "Samsung", "e3q",         "samsung"),
         DeviceInfo("2201123C",   "13", 33, "Xiaomi",  "zeus",        "Xiaomi"),
         DeviceInfo("2210132C",   "14", 34, "Xiaomi",  "nuwa",        "Xiaomi"),
+        DeviceInfo("23049RAD8G", "14", 34, "Xiaomi",  "aristotle",   "Xiaomi"),
         DeviceInfo("CPH2447",    "13", 33, "OPPO",    "OPPO",        "OPPO"),
         DeviceInfo("CPH2499",    "14", 34, "OPPO",    "OPPO",        "OPPO"),
         DeviceInfo("V2217",      "13", 33, "vivo",    "V2217",       "vivo"),
@@ -75,7 +80,7 @@ class DeviceGenerator:
 
 
 # ─────────────────────────────────────────────
-# SIGNATURE (X-Gorgon) — algorithm từ viewv3
+# SIGNATURE (X-Gorgon)
 # ─────────────────────────────────────────────
 
 class Signature:
@@ -137,6 +142,32 @@ class Signature:
 # PROXY MANAGER
 # ─────────────────────────────────────────────
 
+def parse_proxy_line(line: str) -> Optional[str]:
+    """
+    Parse proxy line into a URL usable by aiohttp.
+    Supported formats:
+      ip:port
+      ip:port:user:pass
+      http://ip:port
+      http://user:pass@ip:port
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    # Already a full URL
+    if line.startswith("http://") or line.startswith("https://") or line.startswith("socks5://"):
+        return line
+    parts = line.split(":")
+    if len(parts) == 2:
+        # ip:port
+        return f"http://{parts[0]}:{parts[1]}"
+    elif len(parts) == 4:
+        # ip:port:user:pass
+        ip, port, user, pw = parts
+        return f"http://{user}:{pw}@{ip}:{port}"
+    return None
+
+
 class ProxyManager:
     def __init__(self, proxy_list: List[str] = None):
         self.proxies = proxy_list or []
@@ -152,14 +183,115 @@ class ProxyManager:
             self.idx = (self.idx + 1) % len(self.proxies)
             return p
 
+    def add(self, proxies: List[str]):
+        self.proxies.extend(proxies)
+        logger.info(f"ProxyManager: added {len(proxies)}, total={len(self.proxies)}")
+
+    def clear(self):
+        self.proxies.clear()
+        self.idx = 0
+
+
+# ─────────────────────────────────────────────
+# PROXY LOADER (files + env)
+# ─────────────────────────────────────────────
+
+def load_proxies_from_file(filepath: str) -> List[str]:
+    result = []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                p = parse_proxy_line(line)
+                if p:
+                    result.append(p)
+        logger.info(f"Loaded {len(result)} proxies from {filepath}")
+    except FileNotFoundError:
+        logger.info(f"Proxy file not found: {filepath}")
+    except Exception as e:
+        logger.warning(f"Error loading proxy file {filepath}: {e}")
+    return result
+
+
+def load_proxies_from_env() -> List[str]:
+    raw = os.getenv("PROXY_LIST", "")
+    if not raw:
+        return []
+    proxies = []
+    for item in re.split(r"[,\s]+", raw):
+        p = parse_proxy_line(item)
+        if p:
+            proxies.append(p)
+    logger.info(f"Loaded {len(proxies)} proxies from PROXY_LIST env")
+    return proxies
+
+
+def load_all_proxies() -> List[str]:
+    """Load proxies from all sources: bundled files + env variable."""
+    base_dir = Path(__file__).parent
+    all_proxies: List[str] = []
+
+    # Load bundled proxy files
+    proxy_files = [
+        "proxyscrape_premium_http_proxies_1774854538314.txt",
+        "Webshare_10_proxies_1774854538316.txt",
+    ]
+    for fname in proxy_files:
+        fpath = base_dir / fname
+        all_proxies.extend(load_proxies_from_file(str(fpath)))
+
+    # Load from env (appended last, may override or supplement)
+    all_proxies.extend(load_proxies_from_env())
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for p in all_proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+
+    logger.info(f"Total proxies loaded: {len(unique)}")
+    return unique
+
+
+# ─────────────────────────────────────────────
+# SERVER IP HELPER
+# ─────────────────────────────────────────────
+
+async def get_server_ip() -> str:
+    """Fetch the public IP of the server."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.ipify.org?format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                data = await r.json()
+                return data.get("ip", "Không xác định")
+    except Exception:
+        pass
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://ifconfig.me/ip", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                return (await r.text()).strip()
+    except Exception:
+        return "Không xác định"
+
+
+# ─────────────────────────────────────────────
+# TikTok API ENDPOINTS (fallback list)
+# ─────────────────────────────────────────────
+
+TIKTOK_ENDPOINTS = [
+    "api16-core-c-alisg.tiktokv.com",
+    "api16-normal-c-useast1a.tiktokv.com",
+    "api22-core-c-alisg.tiktokv.com",
+    "api19-core-c-alisg.tiktokv.com",
+]
+
 
 # ─────────────────────────────────────────────
 # VIEW BOT SESSION
 # ─────────────────────────────────────────────
 
 class ViewBotSession:
-    """One active bot session per Telegram command."""
-
     def __init__(self, video_id: str, proxies: List[str] = None):
         self.video_id = video_id
         self.is_running = False
@@ -172,12 +304,18 @@ class ViewBotSession:
         self.proxy_manager = ProxyManager(proxies)
         self._tasks: List[asyncio.Task] = []
         self._stats_lock = asyncio.Lock()
+        self._endpoint_idx = 0
 
-    # ── helpers ──────────────────────────────
+    def _next_endpoint(self) -> str:
+        ep = TIKTOK_ENDPOINTS[self._endpoint_idx % len(TIKTOK_ENDPOINTS)]
+        self._endpoint_idx += 1
+        return ep
 
-    def _build_request(self) -> Tuple[str, dict, dict, dict]:
+    def _build_request(self) -> Tuple[str, str, str, str, dict, dict]:
         dev = DeviceGenerator.random_device()
-        params = (
+        endpoint = self._next_endpoint()
+
+        query_params = (
             f"channel=googleplay&aid=1233&app_name=musical_ly&version_code=400304"
             f"&version_name=40.3.4&device_platform=android"
             f"&device_type={dev.model.replace(' ', '+')}"
@@ -194,55 +332,71 @@ class ViewBotSession:
             f"&mcc_mnc={random.choice(['45201','310260','51010'])}"
             f"&pass-route=1"
         )
-        url = f"https://api16-core-c-alisg.tiktokv.com/aweme/v1/aweme/stats/?{params}"
+        url = f"https://{endpoint}/aweme/v1/aweme/stats/?{query_params}"
 
-        data = {
-            "item_id":    self.video_id,
-            "play_delta": 1,
-            "action_time": int(time.time()),
-            "source":     random.choice([1, 2, 3, 4]),
-            "media_type": 4,
+        data_dict = {
+            "item_id":      self.video_id,
+            "play_delta":   "1",
+            "action_time":  str(int(time.time())),
+            "source":       str(random.choice([1, 2, 3, 4])),
+            "media_type":   "4",
             "content_type": "video",
         }
-        cookies = {
-            "sessionid": secrets.token_hex(20),
-            "uid":       str(random.randint(1000000000, 9999999999)),
-            "cdids":     DeviceGenerator.generate_cdids(),
-        }
+        body_str = urlencode(data_dict)
+
+        session_id = secrets.token_hex(20)
+        uid_val    = str(random.randint(1000000000, 9999999999))
+        cdids_val  = DeviceGenerator.generate_cdids()
+
+        cookie_str = f"sessionid={session_id}; uid={uid_val}; cdids={cdids_val}"
+
         headers = {
-            "Content-Type":  "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent":    f"com.ss.android.ugc.trill/400304 (Linux; U; Android {dev.version}; {dev.model}; Build/PI; tt-ok/3.12.13)",
+            "Content-Type":   "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent":     f"com.ss.android.ugc.trill/400304 (Linux; U; Android {dev.version}; {dev.model}; Build/PI; tt-ok/3.12.13)",
             "Accept-Encoding": "gzip",
-            "Connection":    "Keep-Alive",
-            "Host":          "api16-core-c-alisg.tiktokv.com",
-            "sdk-version":   "2",
-            "x-tt-dm-status": "login=1; launch=0",
+            "Connection":     "Keep-Alive",
+            "Host":           endpoint,
+            "sdk-version":    "2",
+            "x-tt-dm-status": "login=0; launch=1",
+            "Cookie":          cookie_str,
         }
-        return url, data, cookies, headers
+        return url, query_params, body_str, cookie_str, data_dict, headers
 
     async def _send_one(self, semaphore: asyncio.Semaphore) -> bool:
         async with semaphore:
             proxy = await self.proxy_manager.get()
-            proxy_url = f"http://{proxy}" if proxy else None
 
             for attempt in range(3):
                 try:
-                    url, data, cookies, base_hdrs = self._build_request()
-                    sig = Signature(url.split("?")[1], str(data), str(cookies)).generate()
+                    url, query_params, body_str, cookie_str, _, base_hdrs = self._build_request()
+                    sig = Signature(query_params, body_str, cookie_str).generate()
                     headers = {**base_hdrs, **sig}
 
                     async with self.session.post(
-                        url, data=data, headers=headers,
-                        cookies=cookies, proxy=proxy_url, ssl=False
+                        url,
+                        data=body_str,
+                        headers=headers,
+                        proxy=proxy,
+                        ssl=False,
                     ) as resp:
                         if resp.status == 200:
-                            async with self._stats_lock:
-                                self.count += 1
-                                self.successful += 1
-                            return True
+                            body = await resp.text()
+                            if '"status_code":0' in body or '"status_code": 0' in body or body.strip() == "":
+                                async with self._stats_lock:
+                                    self.count += 1
+                                    self.successful += 1
+                                return True
+                            else:
+                                async with self._stats_lock:
+                                    self.failed += 1
+                                return False
                         elif resp.status == 429:
                             await asyncio.sleep(2 ** attempt)
                             continue
+                        elif resp.status in (403, 401):
+                            async with self._stats_lock:
+                                self.failed += 1
+                            return False
                         else:
                             if attempt < 2:
                                 await asyncio.sleep(0.1 * (attempt + 1))
@@ -257,7 +411,8 @@ class ViewBotSession:
                             self.failed += 1
                         return False
                     await asyncio.sleep(0.05 * (attempt + 1))
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"_send_one error: {e}")
                     async with self._stats_lock:
                         self.failed += 1
                     return False
@@ -265,7 +420,7 @@ class ViewBotSession:
 
     async def _sender_loop(self, semaphore: asyncio.Semaphore):
         consecutive = 0
-        base_delay = 0.001
+        base_delay = 0.005
 
         while self.is_running:
             ok = await self._send_one(semaphore)
@@ -282,30 +437,33 @@ class ViewBotSession:
             elif spd > 1000:
                 delay *= 2.0
 
-            await asyncio.sleep(delay + random.uniform(0, 0.002))
+            await asyncio.sleep(delay + random.uniform(0, 0.005))
 
-    # ── lifecycle ─────────────────────────────
-
-    async def start(self, workers: int = 1500):
+    async def start(self, workers: int = 300):
         import ssl
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
+        limit = min(200, workers)
         connector = aiohttp.TCPConnector(
-            limit=200, limit_per_host=20,
-            ttl_dns_cache=300, ssl=ctx,
-            force_close=False, enable_cleanup_closed=True
+            limit=limit,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            ssl=ctx,
+            force_close=False,
+            enable_cleanup_closed=True,
         )
-        timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+        timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=12)
         self.session = aiohttp.ClientSession(
-            timeout=timeout, connector=connector,
-            cookie_jar=aiohttp.DummyCookieJar()
+            timeout=timeout,
+            connector=connector,
+            cookie_jar=aiohttp.DummyCookieJar(),
         )
 
         self.is_running = True
         self.start_time = time.time()
-        sem = asyncio.Semaphore(min(500, workers // 3))
+        sem = asyncio.Semaphore(min(limit, max(workers // 5, 20)))
 
         self._tasks = [
             asyncio.create_task(self._sender_loop(sem))
@@ -322,8 +480,6 @@ class ViewBotSession:
         if self.session:
             await self.session.close()
         logger.info(f"Session stopped: video={self.video_id}")
-
-    # ── stats ─────────────────────────────────
 
     def stats(self) -> Dict:
         elapsed = time.time() - self.start_time if self.start_time else 1
@@ -345,6 +501,8 @@ class ViewBotSession:
 
     def stats_text(self) -> str:
         s = self.stats()
+        n = len(self.proxy_manager.proxies)
+        proxy_info = f"🌐 Proxy: *{n} proxies*" if n else "⚠️ Proxy: *Không có*"
         return (
             f"📊 *Thống kê — Video ID:* `{self.video_id}`\n"
             f"{'─'*34}\n"
@@ -357,6 +515,7 @@ class ViewBotSession:
             f"✅ Thành công: *{s['ok']:,}*\n"
             f"❌ Thất bại: *{s['fail']:,}*\n"
             f"🎯 Tỷ lệ thành công: *{s['rate']:.1f}%*\n"
+            f"{proxy_info}\n"
             f"{'─'*34}\n"
             f"{'🟢 Đang chạy' if self.is_running else '🔴 Đã dừng'}"
         )
@@ -367,20 +526,24 @@ class ViewBotSession:
 # ─────────────────────────────────────────────
 
 def get_video_id(url: str) -> Optional[str]:
-    url = url.split("?")[0]
+    url_clean = url.split("?")[0]
     for pat in [r"/video/(\d+)", r"tiktok\.com/@[^/]+/(\d+)", r"(\d{18,19})"]:
-        m = re.search(pat, url)
+        m = re.search(pat, url_clean)
         if m:
             return m.group(1)
     try:
         hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
             "Connection": "keep-alive",
         }
-        r = requests.get(url, headers=hdrs, timeout=15)
-        r.raise_for_status()
+        r = requests.get(url, headers=hdrs, timeout=15, allow_redirects=True)
+        final_url = r.url.split("?")[0]
+        for pat in [r"/video/(\d+)", r"tiktok\.com/@[^/]+/(\d+)"]:
+            m = re.search(pat, final_url)
+            if m:
+                return m.group(1)
         for pat in [r'"id":"(\d{19})"', r'aweme_id["\']:\s*["\'](\d{19})', r'video/(\d{19})', r'(\d{19})']:
             m = re.search(pat, r.text)
             if m:
@@ -391,13 +554,12 @@ def get_video_id(url: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM BOT
+# TELEGRAM BOT STATE
 # ─────────────────────────────────────────────
 
-# Map chat_id → ViewBotSession
 active_sessions: Dict[int, ViewBotSession] = {}
-# Map chat_id → periodic status task
 status_tasks: Dict[int, asyncio.Task] = {}
+global_proxies: List[str] = []
 
 AUTHORIZED_IDS_RAW = os.getenv("AUTHORIZED_CHAT_IDS", "")
 AUTHORIZED_IDS = set()
@@ -409,18 +571,31 @@ if AUTHORIZED_IDS_RAW:
 
 def is_authorized(chat_id: int) -> bool:
     if not AUTHORIZED_IDS:
-        return True  # open access when no whitelist configured
+        return True
     return chat_id in AUTHORIZED_IDS
 
 
+# ─────────────────────────────────────────────
+# COMMAND HANDLERS
+# ─────────────────────────────────────────────
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    server_ip = await get_server_ip()
+    proxy_status = f"✅ *{len(global_proxies)} proxies* đã nạp" if global_proxies else "⚠️ Chưa có proxy"
+
     await update.message.reply_text(
         "👋 *TikTok View Bot — Telegram Edition*\n\n"
+        f"🖥 *Server IP:* `{server_ip}`\n"
+        f"🌐 *Proxy:* {proxy_status}\n\n"
         "📋 *Danh sách lệnh:*\n"
         "`/view <URL>` — Bắt đầu gửi view\n"
         "`/stop` — Dừng session hiện tại\n"
         "`/stats` — Xem thống kê\n"
-        "`/workers <số>` — Đặt số workers (mặc định 1500)\n"
+        "`/workers <số>` — Đặt số workers (mặc định 300)\n"
+        "`/proxy` — Xem & quản lý proxy\n"
+        "`/proxy add ip:port,...` — Thêm proxy\n"
+        "`/proxy clear` — Xóa tất cả proxy\n"
+        "`/proxy reload` — Tải lại proxy từ file\n"
         "`/help` — Hiển thị trợ giúp này\n\n"
         "⚠️ Chỉ dùng cho mục đích học tập.",
         parse_mode=ParseMode.MARKDOWN,
@@ -429,6 +604,93 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, ctx)
+
+
+async def cmd_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /proxy              — show current proxy list
+    /proxy add ip:port,... — add proxies
+    /proxy clear        — clear all proxies
+    /proxy reload       — reload from bundled files
+    """
+    global global_proxies
+    chat_id = update.effective_chat.id
+    if not is_authorized(chat_id):
+        await update.message.reply_text("⛔ Bạn không có quyền dùng bot này.")
+        return
+
+    args = ctx.args  # list of words after /proxy
+
+    # ── /proxy add ───────────────────────────
+    if args and args[0].lower() == "add":
+        raw = " ".join(args[1:])
+        if not raw.strip():
+            await update.message.reply_text(
+                "❌ Cú pháp: `/proxy add ip:port,ip:port,...`\n\n"
+                "Hỗ trợ:\n"
+                "• `ip:port` — proxy không auth\n"
+                "• `ip:port:user:pass` — proxy có auth (Webshare)\n"
+                "• `http://user:pass@ip:port` — URL đầy đủ",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        new_proxies = []
+        for item in re.split(r"[,\n]+", raw):
+            p = parse_proxy_line(item)
+            if p:
+                new_proxies.append(p)
+
+        global_proxies.extend(new_proxies)
+        # Remove duplicates (keep order)
+        seen = set(); unique = []
+        for p in global_proxies:
+            if p not in seen:
+                seen.add(p); unique.append(p)
+        global_proxies[:] = unique
+
+        await update.message.reply_text(
+            f"✅ Đã thêm *{len(new_proxies)}* proxy.\n"
+            f"📋 Tổng cộng: *{len(global_proxies)}* proxy.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ── /proxy clear ─────────────────────────
+    if args and args[0].lower() == "clear":
+        count = len(global_proxies)
+        global_proxies.clear()
+        await update.message.reply_text(f"🗑 Đã xóa *{count}* proxy.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── /proxy reload ────────────────────────
+    if args and args[0].lower() == "reload":
+        global_proxies[:] = load_all_proxies()
+        await update.message.reply_text(
+            f"🔄 Đã tải lại proxy từ file.\n"
+            f"📋 Tổng cộng: *{len(global_proxies)}* proxy.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ── /proxy (no args) — show list ─────────
+    if not global_proxies:
+        await update.message.reply_text(
+            "📋 *Danh sách proxy:* Trống\n\n"
+            "Dùng `/proxy add ip:port,...` để thêm.\n"
+            "Hoặc `/proxy reload` để load từ file bundled.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    preview = global_proxies[:20]
+    more = len(global_proxies) - 20
+    text = f"📋 *Danh sách proxy ({len(global_proxies)} proxies):*\n"
+    text += "\n".join(f"`{p}`" for p in preview)
+    if more > 0:
+        text += f"\n_...và {more} proxy khác_"
+    text += "\n\n`/proxy add` · `/proxy clear` · `/proxy reload`"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -442,9 +704,8 @@ async def cmd_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     url = ctx.args[0].strip()
-    workers = int(ctx.bot_data.get(f"workers_{chat_id}", 1500))
+    workers = int(ctx.bot_data.get(f"workers_{chat_id}", 300))
 
-    # Stop existing session
     if chat_id in active_sessions:
         await active_sessions[chat_id].stop()
         del active_sessions[chat_id]
@@ -458,22 +719,28 @@ async def cmd_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     video_id = await loop.run_in_executor(None, get_video_id, url)
 
     if not video_id:
-        await msg.edit_text("❌ Không tìm thấy Video ID. Kiểm tra lại URL!")
+        await msg.edit_text(
+            "❌ Không tìm thấy Video ID. Kiểm tra lại URL!\n\n"
+            "Thử dùng link đầy đủ:\n`https://www.tiktok.com/@user/video/1234567890`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    session = ViewBotSession(video_id)
+    session = ViewBotSession(video_id, proxies=list(global_proxies))
     active_sessions[chat_id] = session
 
+    proxy_warn = "" if global_proxies else "\n⚠️ *Chưa có proxy* — dùng `/proxy add` để thêm."
     await msg.edit_text(
         f"✅ Video ID: `{video_id}`\n"
         f"⚙️ Workers: *{workers:,}*\n"
+        f"🌐 Proxies: *{len(global_proxies)}*"
+        f"{proxy_warn}\n"
         f"🚀 Đang khởi động bot...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     await session.start(workers=workers)
 
-    # Start periodic status updates every 30s
     async def send_status_loop():
         while session.is_running:
             await asyncio.sleep(30)
@@ -496,7 +763,8 @@ async def cmd_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🟢 *Bot đã chạy!*\n\n"
             f"📹 Video ID: `{video_id}`\n"
             f"⚙️ Workers: *{workers:,}*\n"
-            f"📊 Thống kê sẽ cập nhật mỗi 30 giây.\n"
+            f"🌐 Proxies: *{len(global_proxies)}*\n"
+            f"📊 Thống kê cập nhật mỗi 30 giây.\n"
             f"Dùng /stop để dừng."
         ),
         parse_mode=ParseMode.MARKDOWN,
@@ -552,13 +820,19 @@ async def cmd_workers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if not ctx.args or not ctx.args[0].isdigit():
-        await update.message.reply_text("❌ Cú pháp: `/workers <số>` (VD: `/workers 2000`)", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Cú pháp: `/workers <số>` (VD: `/workers 300`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     n = int(ctx.args[0])
-    n = max(100, min(n, 10000))
+    n = max(50, min(n, 5000))
     ctx.bot_data[f"workers_{chat_id}"] = n
-    await update.message.reply_text(f"✅ Số workers đặt thành *{n:,}* cho lần chạy tiếp theo.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"✅ Số workers đặt thành *{n:,}* cho lần chạy tiếp theo.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -570,9 +844,14 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 def main():
+    global global_proxies
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         sys.exit("TELEGRAM_BOT_TOKEN not set!")
+
+    # Load proxies from bundled files + env variable
+    global_proxies = load_all_proxies()
 
     app = Application.builder().token(token).build()
 
@@ -582,9 +861,10 @@ def main():
     app.add_handler(CommandHandler("stop",    cmd_stop))
     app.add_handler(CommandHandler("stats",   cmd_stats))
     app.add_handler(CommandHandler("workers", cmd_workers))
+    app.add_handler(CommandHandler("proxy",   cmd_proxy))
     app.add_error_handler(error_handler)
 
-    logger.info("Bot starting (polling)...")
+    logger.info(f"Bot starting... proxies={len(global_proxies)}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
